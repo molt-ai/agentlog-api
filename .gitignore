@@ -1,0 +1,14 @@
+node_modules/
+.DS_Store
+
+# Database
+*.db
+*.db-journal
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Fly.io
+.fly/
