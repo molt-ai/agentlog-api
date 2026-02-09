@@ -2,6 +2,107 @@
 
 Backend API for [AgentLog Mobile](https://github.com/molt-ai/agentlog-mobile) — real-time AI agent observability.
 
+## 🔥 Universal AI Proxy
+
+**One endpoint, any provider, automatic logging.** Just change your `baseURL` and every AI call is automatically tracked.
+
+### Quick Start
+
+```javascript
+// OpenAI SDK
+import OpenAI from 'openai';
+
+const openai = new OpenAI({
+  baseURL: 'https://agentlog-api.fly.dev/v1',
+  apiKey: 'agentlog_xxx',  // Your AgentLog API key
+  defaultHeaders: {
+    'X-Provider-Key': 'sk-xxx'  // Your actual OpenAI key
+  }
+});
+
+// Use normally - all calls are logged automatically!
+const response = await openai.chat.completions.create({
+  model: 'gpt-4o',
+  messages: [{ role: 'user', content: 'Hello!' }]
+});
+```
+
+### Supported Providers
+
+| Provider | Models | Auto-detected from |
+|----------|--------|-------------------|
+| **OpenAI** | gpt-4, gpt-4o, gpt-3.5-turbo, o1-* | `gpt-*`, `o1*` |
+| **Anthropic** | claude-3-opus, claude-3-sonnet, claude-3-haiku | `claude-*` |
+| **Google** | gemini-pro, gemini-1.5-pro, gemini-1.5-flash | `gemini-*` |
+| **xAI** | grok-2, grok-beta | `grok-*` |
+| **OpenRouter** | any model | `provider/model` format |
+
+### Anthropic Example
+
+```javascript
+// Works with Anthropic models too!
+const response = await openai.chat.completions.create({
+  model: 'claude-3-5-sonnet-20241022',
+  messages: [{ role: 'user', content: 'Hello Claude!' }]
+});
+// AgentLog auto-converts to Anthropic format and back
+```
+
+### Streaming
+
+```javascript
+const stream = await openai.chat.completions.create({
+  model: 'gpt-4o',
+  messages: [{ role: 'user', content: 'Write a story' }],
+  stream: true
+});
+
+for await (const chunk of stream) {
+  process.stdout.write(chunk.choices[0]?.delta?.content || '');
+}
+// Full response is logged when stream completes
+```
+
+### Use with Cursor, Continue, etc.
+
+Any OpenAI-compatible tool works:
+
+```json
+// .cursor/settings.json
+{
+  "openai.apiBase": "https://agentlog-api.fly.dev/v1",
+  "openai.apiKey": "agentlog_xxx"
+}
+```
+
+Then set `X-Provider-Key` header in your tool's custom headers.
+
+### What Gets Logged
+
+Every proxy call automatically tracks:
+- ✅ Model used
+- ✅ Input/output tokens
+- ✅ Cost (calculated from token usage)
+- ✅ Duration
+- ✅ Full prompt and completion
+- ✅ Success/failure status
+- ✅ Provider errors
+
+### cURL Example
+
+```bash
+curl https://agentlog-api.fly.dev/v1/chat/completions \
+  -H "Authorization: Bearer agentlog_xxx" \
+  -H "X-Provider-Key: sk-openai-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+---
+
 ## 🚀 Deployment
 
 Deployed on [Fly.io](https://fly.io) at `https://agentlog-api.fly.dev`
@@ -11,6 +112,25 @@ fly deploy
 ```
 
 ## 📡 Endpoints
+
+### Universal AI Proxy
+```
+POST /v1/chat/completions
+Authorization: Bearer YOUR_AGENTLOG_KEY
+X-Provider-Key: YOUR_PROVIDER_API_KEY (OpenAI, Anthropic, etc.)
+
+{
+  "model": "gpt-4o",  // or claude-3-sonnet, gemini-pro, etc.
+  "messages": [{"role": "user", "content": "Hello"}],
+  "stream": false
+}
+```
+
+### List Available Models
+```
+GET /v1/models
+Authorization: Bearer YOUR_API_KEY
+```
 
 ### Health Check
 ```

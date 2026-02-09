@@ -959,9 +959,533 @@ app.post('/api/improve-prompt', validateApiKey, (req, res) => {
   });
 });
 
+// ===== UNIVERSAL AI PROXY =====
+
+// Model costs (USD per 1K tokens)
+const MODEL_COSTS = {
+  // OpenAI GPT-4
+  'gpt-4': { input: 0.03, output: 0.06 },
+  'gpt-4-32k': { input: 0.06, output: 0.12 },
+  'gpt-4-turbo': { input: 0.01, output: 0.03 },
+  'gpt-4-turbo-preview': { input: 0.01, output: 0.03 },
+  'gpt-4o': { input: 0.005, output: 0.015 },
+  'gpt-4o-mini': { input: 0.00015, output: 0.0006 },
+  // OpenAI GPT-3.5
+  'gpt-3.5-turbo': { input: 0.0005, output: 0.0015 },
+  'gpt-3.5-turbo-16k': { input: 0.003, output: 0.004 },
+  // OpenAI o1
+  'o1-preview': { input: 0.015, output: 0.06 },
+  'o1-mini': { input: 0.003, output: 0.012 },
+  'o1': { input: 0.015, output: 0.06 },
+  // Anthropic Claude 3.5
+  'claude-3-5-sonnet-20240620': { input: 0.003, output: 0.015 },
+  'claude-3-5-sonnet-20241022': { input: 0.003, output: 0.015 },
+  'claude-3-5-haiku-20241022': { input: 0.001, output: 0.005 },
+  // Anthropic Claude 3
+  'claude-3-opus-20240229': { input: 0.015, output: 0.075 },
+  'claude-3-sonnet-20240229': { input: 0.003, output: 0.015 },
+  'claude-3-haiku-20240307': { input: 0.00025, output: 0.00125 },
+  // Shorthand aliases
+  'claude-3-opus': { input: 0.015, output: 0.075 },
+  'claude-3-sonnet': { input: 0.003, output: 0.015 },
+  'claude-3-haiku': { input: 0.00025, output: 0.00125 },
+  'claude-3.5-sonnet': { input: 0.003, output: 0.015 },
+  'claude-3.5-haiku': { input: 0.001, output: 0.005 },
+  // Google Gemini
+  'gemini-pro': { input: 0.00025, output: 0.0005 },
+  'gemini-1.5-pro': { input: 0.00125, output: 0.005 },
+  'gemini-1.5-flash': { input: 0.000075, output: 0.0003 },
+  // xAI Grok
+  'grok-beta': { input: 0.005, output: 0.015 },
+  'grok-2': { input: 0.002, output: 0.01 },
+};
+
+// Calculate cost for tokens
+function calculateCost(model, inputTokens, outputTokens) {
+  const costs = MODEL_COSTS[model];
+  if (!costs) {
+    // Try partial match
+    const matchedKey = Object.keys(MODEL_COSTS).find(key => 
+      model.includes(key) || key.includes(model)
+    );
+    if (matchedKey) {
+      const matchedCosts = MODEL_COSTS[matchedKey];
+      return (inputTokens / 1000) * matchedCosts.input + (outputTokens / 1000) * matchedCosts.output;
+    }
+    return 0;
+  }
+  return (inputTokens / 1000) * costs.input + (outputTokens / 1000) * costs.output;
+}
+
+// Detect provider from model name
+function detectProvider(model) {
+  if (!model) return 'openai';
+  model = model.toLowerCase();
+  if (model.startsWith('gpt-') || model.startsWith('o1') || model.includes('openai')) return 'openai';
+  if (model.startsWith('claude-')) return 'anthropic';
+  if (model.startsWith('gemini-')) return 'google';
+  if (model.startsWith('grok-')) return 'xai';
+  if (model.includes('/')) return 'openrouter'; // format: provider/model
+  return 'openai'; // default
+}
+
+// Get provider endpoint
+function getProviderEndpoint(provider) {
+  const endpoints = {
+    openai: 'https://api.openai.com/v1/chat/completions',
+    anthropic: 'https://api.anthropic.com/v1/messages',
+    google: 'https://generativelanguage.googleapis.com/v1beta/models',
+    xai: 'https://api.x.ai/v1/chat/completions',
+    openrouter: 'https://openrouter.ai/api/v1/chat/completions'
+  };
+  return endpoints[provider] || endpoints.openai;
+}
+
+// Convert OpenAI format to Anthropic format
+function convertToAnthropic(openaiRequest) {
+  const { model, messages, max_tokens, temperature, stream } = openaiRequest;
+  
+  // Extract system message
+  const systemMessage = messages.find(m => m.role === 'system');
+  const otherMessages = messages.filter(m => m.role !== 'system');
+  
+  return {
+    model: model,
+    max_tokens: max_tokens || 4096,
+    messages: otherMessages.map(m => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: m.content
+    })),
+    ...(systemMessage && { system: systemMessage.content }),
+    ...(temperature !== undefined && { temperature }),
+    stream: stream || false
+  };
+}
+
+// Convert Anthropic response to OpenAI format
+function convertFromAnthropic(anthropicResponse, model) {
+  return {
+    id: anthropicResponse.id || 'chatcmpl-' + crypto.randomUUID(),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: model,
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: anthropicResponse.content?.[0]?.text || ''
+      },
+      finish_reason: anthropicResponse.stop_reason === 'end_turn' ? 'stop' : anthropicResponse.stop_reason
+    }],
+    usage: {
+      prompt_tokens: anthropicResponse.usage?.input_tokens || 0,
+      completion_tokens: anthropicResponse.usage?.output_tokens || 0,
+      total_tokens: (anthropicResponse.usage?.input_tokens || 0) + (anthropicResponse.usage?.output_tokens || 0)
+    }
+  };
+}
+
+// Convert OpenAI format to Google Gemini format
+function convertToGemini(openaiRequest) {
+  const { messages, max_tokens, temperature } = openaiRequest;
+  
+  // Extract system message
+  const systemMessage = messages.find(m => m.role === 'system');
+  const otherMessages = messages.filter(m => m.role !== 'system');
+  
+  return {
+    contents: otherMessages.map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }]
+    })),
+    ...(systemMessage && {
+      systemInstruction: { parts: [{ text: systemMessage.content }] }
+    }),
+    generationConfig: {
+      ...(max_tokens && { maxOutputTokens: max_tokens }),
+      ...(temperature !== undefined && { temperature })
+    }
+  };
+}
+
+// Convert Gemini response to OpenAI format
+function convertFromGemini(geminiResponse, model) {
+  const candidate = geminiResponse.candidates?.[0];
+  const content = candidate?.content?.parts?.[0]?.text || '';
+  
+  return {
+    id: 'chatcmpl-' + crypto.randomUUID(),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: model,
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: content
+      },
+      finish_reason: candidate?.finishReason === 'STOP' ? 'stop' : 'length'
+    }],
+    usage: {
+      prompt_tokens: geminiResponse.usageMetadata?.promptTokenCount || 0,
+      completion_tokens: geminiResponse.usageMetadata?.candidatesTokenCount || 0,
+      total_tokens: geminiResponse.usageMetadata?.totalTokenCount || 0
+    }
+  };
+}
+
+// Estimate tokens (rough: ~4 chars per token)
+function estimateTokens(text) {
+  if (!text) return 0;
+  return Math.ceil(text.length / 4);
+}
+
+// Universal AI Proxy endpoint
+app.post('/v1/chat/completions', validateApiKey, async (req, res) => {
+  const startTime = Date.now();
+  const { model, messages, stream, ...rest } = req.body;
+  
+  if (!model || !messages) {
+    return res.status(400).json({ error: 'model and messages are required' });
+  }
+  
+  // Get provider API key from header or error
+  const providerKey = req.headers['x-provider-key'];
+  if (!providerKey) {
+    return res.status(400).json({ 
+      error: 'X-Provider-Key header is required',
+      message: 'Pass your provider API key (OpenAI, Anthropic, etc.) in the X-Provider-Key header'
+    });
+  }
+  
+  const provider = detectProvider(model);
+  const taskId = crypto.randomUUID();
+  const traceId = crypto.randomUUID();
+  const promptText = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+  
+  // Log as running
+  db.prepare(`
+    INSERT INTO tasks (
+      id, api_key_id, agent_name, description, status, duration_ms, cost, provider, metadata, created_at,
+      model, prompt, trace_id, started_at
+    )
+    VALUES (?, ?, 'proxy', ?, 'running', 0, 0, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    taskId,
+    req.apiKey.id,
+    `Proxy: ${model}`,
+    provider,
+    JSON.stringify({ stream: !!stream, message_count: messages.length }),
+    new Date().toISOString(),
+    model,
+    promptText,
+    traceId,
+    new Date().toISOString()
+  );
+  
+  console.log(`[PROXY] ${provider}/${model} | Task ${taskId}`);
+  
+  try {
+    let response;
+    let responseData;
+    let tokensIn = 0;
+    let tokensOut = 0;
+    let completionText = '';
+    
+    if (provider === 'anthropic') {
+      // Convert and send to Anthropic
+      const anthropicRequest = convertToAnthropic(req.body);
+      
+      if (stream) {
+        // Streaming for Anthropic
+        response = await fetch(getProviderEndpoint(provider), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': providerKey,
+            'anthropic-version': '2023-06-01'
+          },
+          body: JSON.stringify(anthropicRequest)
+        });
+        
+        if (!response.ok) {
+          const error = await response.text();
+          throw new Error(`Anthropic error: ${response.status} - ${error}`);
+        }
+        
+        // Set up SSE streaming
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') {
+                res.write('data: [DONE]\n\n');
+                continue;
+              }
+              
+              try {
+                const event = JSON.parse(data);
+                
+                // Track usage from Anthropic events
+                if (event.type === 'message_start') {
+                  tokensIn = event.message?.usage?.input_tokens || 0;
+                }
+                if (event.type === 'message_delta') {
+                  tokensOut = event.usage?.output_tokens || 0;
+                }
+                if (event.type === 'content_block_delta' && event.delta?.text) {
+                  completionText += event.delta.text;
+                  
+                  // Convert to OpenAI streaming format
+                  const openaiChunk = {
+                    id: 'chatcmpl-' + taskId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: { content: event.delta.text },
+                      finish_reason: null
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+                }
+                if (event.type === 'message_stop') {
+                  const finalChunk = {
+                    id: 'chatcmpl-' + taskId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: {},
+                      finish_reason: 'stop'
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                  res.write('data: [DONE]\n\n');
+                }
+              } catch (e) {
+                // Skip malformed JSON
+              }
+            }
+          }
+        }
+        
+        res.end();
+      } else {
+        // Non-streaming Anthropic
+        response = await fetch(getProviderEndpoint(provider), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': providerKey,
+            'anthropic-version': '2023-06-01'
+          },
+          body: JSON.stringify(anthropicRequest)
+        });
+        
+        if (!response.ok) {
+          const error = await response.text();
+          throw new Error(`Anthropic error: ${response.status} - ${error}`);
+        }
+        
+        const anthropicData = await response.json();
+        responseData = convertFromAnthropic(anthropicData, model);
+        tokensIn = responseData.usage.prompt_tokens;
+        tokensOut = responseData.usage.completion_tokens;
+        completionText = responseData.choices[0]?.message?.content || '';
+        
+        res.json(responseData);
+      }
+    } else if (provider === 'google') {
+      // Convert and send to Gemini
+      const geminiRequest = convertToGemini(req.body);
+      const geminiModel = model.includes(':') ? model : model;
+      const url = `${getProviderEndpoint(provider)}/${geminiModel}:generateContent?key=${providerKey}`;
+      
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(geminiRequest)
+      });
+      
+      if (!response.ok) {
+        const error = await response.text();
+        throw new Error(`Gemini error: ${response.status} - ${error}`);
+      }
+      
+      const geminiData = await response.json();
+      responseData = convertFromGemini(geminiData, model);
+      tokensIn = responseData.usage.prompt_tokens;
+      tokensOut = responseData.usage.completion_tokens;
+      completionText = responseData.choices[0]?.message?.content || '';
+      
+      res.json(responseData);
+    } else {
+      // OpenAI, xAI, OpenRouter - pass through directly
+      const endpoint = getProviderEndpoint(provider);
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${providerKey}`
+      };
+      
+      // Add OpenRouter specific headers if needed
+      if (provider === 'openrouter') {
+        headers['HTTP-Referer'] = 'https://agentlog.dev';
+        headers['X-Title'] = 'AgentLog Proxy';
+      }
+      
+      if (stream) {
+        response = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ model, messages, stream: true, ...rest })
+        });
+        
+        if (!response.ok) {
+          const error = await response.text();
+          throw new Error(`${provider} error: ${response.status} - ${error}`);
+        }
+        
+        // Stream through SSE
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              res.write(line + '\n\n');
+              
+              const data = line.slice(6);
+              if (data !== '[DONE]') {
+                try {
+                  const chunk = JSON.parse(data);
+                  const delta = chunk.choices?.[0]?.delta?.content;
+                  if (delta) completionText += delta;
+                } catch (e) {}
+              }
+            }
+          }
+        }
+        
+        res.end();
+        
+        // Estimate tokens for streaming (actual usage not available in stream)
+        tokensIn = estimateTokens(promptText);
+        tokensOut = estimateTokens(completionText);
+      } else {
+        response = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ model, messages, stream: false, ...rest })
+        });
+        
+        if (!response.ok) {
+          const error = await response.text();
+          throw new Error(`${provider} error: ${response.status} - ${error}`);
+        }
+        
+        responseData = await response.json();
+        tokensIn = responseData.usage?.prompt_tokens || estimateTokens(promptText);
+        tokensOut = responseData.usage?.completion_tokens || 0;
+        completionText = responseData.choices?.[0]?.message?.content || '';
+        
+        res.json(responseData);
+      }
+    }
+    
+    // Calculate cost and update task
+    const durationMs = Date.now() - startTime;
+    const cost = calculateCost(model, tokensIn, tokensOut);
+    
+    db.prepare(`
+      UPDATE tasks SET 
+        status = 'success',
+        duration_ms = ?,
+        cost = ?,
+        completion = ?,
+        tokens_in = ?,
+        tokens_out = ?,
+        completed_at = ?
+      WHERE id = ?
+    `).run(durationMs, cost, completionText, tokensIn, tokensOut, new Date().toISOString(), taskId);
+    
+    console.log(`[PROXY] ✓ ${model} | ${durationMs}ms | ${tokensIn}+${tokensOut} tokens | $${cost.toFixed(4)}`);
+    
+  } catch (error) {
+    const durationMs = Date.now() - startTime;
+    
+    db.prepare(`
+      UPDATE tasks SET 
+        status = 'failed',
+        duration_ms = ?,
+        error = ?,
+        completed_at = ?
+      WHERE id = ?
+    `).run(durationMs, error.message, new Date().toISOString(), taskId);
+    
+    console.error(`[PROXY] ✗ ${model} | ${error.message}`);
+    
+    // Only send error if headers not sent (non-streaming)
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: { 
+          message: error.message,
+          type: 'proxy_error',
+          provider: provider
+        }
+      });
+    }
+  }
+});
+
+// List models endpoint (for OpenAI compatibility)
+app.get('/v1/models', validateApiKey, (req, res) => {
+  const models = Object.keys(MODEL_COSTS).map(id => ({
+    id,
+    object: 'model',
+    created: 1700000000,
+    owned_by: detectProvider(id)
+  }));
+  
+  res.json({
+    object: 'list',
+    data: models
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`AgentLog API running on port ${PORT}`);
   const apiKey = db.prepare('SELECT key FROM api_keys LIMIT 1').get();
   console.log(`API Key: ${apiKey.key}`);
+  console.log(`Proxy endpoint: POST /v1/chat/completions`);
 });
